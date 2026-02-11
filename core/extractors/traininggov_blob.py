@@ -6,6 +6,9 @@ import pandas as pd
 # Helpers
 # -----------------------------
 
+OUT_COLS = ["unit_code", "unit_title", "element_title", "pcs_text"]
+
+
 def _clean(s: str) -> str:
     return re.sub(r"\s+", " ", (s or "").strip())
 
@@ -26,77 +29,59 @@ def norm_col(c: str) -> str:
 def find_unit_code_col(df: pd.DataFrame):
     for c in df.columns:
         n = norm_col(c)
-
-        # Direct common names
-        if n in {
-            "unit code", "unitcode", "code",
-            "national code", "nationalcode",
-            "uoc code", "competency code", "unit id", "unitid"
-        }:
+        if n in {"unit code", "unitcode", "code", "national code", "nationalcode", "uoc code"}:
             return c
-
-        # Pattern matches
-        if ("unit" in n and "code" in n) or ("national" in n and "code" in n):
+        if ("unit" in n and "code" in n) or ("national" in n and "code" in n) or ("uoc" in n and "code" in n):
             return c
-        if ("uoc" in n and "code" in n) or ("competency" in n and "code" in n):
-            return c
-
     return None
 
 
 def find_unit_title_col(df: pd.DataFrame):
     for c in df.columns:
         n = norm_col(c)
-
-        # Direct common names
-        if n in {
-            "unit title", "unit name", "title", "name",
-            "national title", "national name",
-            "uoc title", "uoc name",
-            "competency title", "competency name"
-        }:
+        if n in {"unit title", "unit name", "title", "name", "national title", "national name", "uoc title"}:
             return c
-
-        # Pattern matches
-        if ("unit" in n and ("title" in n or "name" in n)):
+        if ("unit" in n and ("title" in n or "name" in n)) or ("national" in n and ("title" in n or "name" in n)) or (
+            "uoc" in n and ("title" in n or "name" in n)
+        ):
             return c
-        if ("national" in n and ("title" in n or "name" in n)):
-            return c
-        if ("uoc" in n and ("title" in n or "name" in n)):
-            return c
-        if ("competency" in n and ("title" in n or "name" in n)):
-            return c
-
     return None
 
 
 def find_blob_col(df: pd.DataFrame):
-    """
-    Find the column that contains the elements + performance criteria text.
-    Examples seen in exports:
-    - Elements and Performance Criteria
-    - Elements & Performance Criteria
-    - Elements and Criteria
-    - Element and Performance Criteria (singular)
-    """
     for c in df.columns:
         n = norm_col(c)
-
-        # Strong signals
-        if "element" in n and "performance" in n:
+        if "element" in n and ("performance" in n or "criteria" in n or "criterion" in n):
             return c
-        if "elements" in n and "performance" in n:
+        if "elements" in n and ("performance" in n or "criteria" in n or "criterion" in n):
             return c
-        if "element" in n and "criteria" in n:
-            return c
-        if "elements" in n and "criteria" in n:
-            return c
-
-        # Sometimes abbreviated
-        if "element" in n and "pc" in n:
-            return c
-
     return None
+
+
+def normalize_blob_text(text: str) -> str:
+    """
+    Many training.gov exports store the whole section as a single long string.
+    We insert newlines before element headings and performance criteria numbers.
+    """
+    t = (text or "").replace("\r\n", "\n").replace("\r", "\n")
+    t = re.sub(r"\s+", " ", t).strip()
+
+    if not t:
+        return ""
+
+    # Insert newline before PCs like "1.1." "2.3." etc (do this FIRST)
+    t = re.sub(r"\s*(\d+\.\d+)\.\s*", r"\n\1. ", t)
+
+    # Insert newline before element headings like "1." "2." but not "1.1."
+    # Negative lookahead to avoid splitting "1.1" where next char is digit
+    t = re.sub(r"\s*(\d+)\.(?!\d)\s*", r"\n\1. ", t)
+
+    # Also support "Element 1:" style headings
+    t = re.sub(r"\s*(Element\s+\d+)\s*[:.]\s*", r"\n\1: ", t, flags=re.I)
+
+    # Cleanup: trim and ensure lines
+    lines = [ln.strip() for ln in t.split("\n") if ln.strip()]
+    return "\n".join(lines)
 
 
 # -----------------------------
@@ -104,12 +89,6 @@ def find_blob_col(df: pd.DataFrame):
 # -----------------------------
 
 class TrainingGovBlobExtractor:
-    """
-    Handles the "training.gov.au-style blob" where a single field includes:
-    - Element headings
-    - Performance criteria numbering (e.g., 1.1, 1.2...)
-    """
-
     name = "training.gov.au blob (Elements & Performance Criteria)"
 
     def can_handle(self, df: pd.DataFrame):
@@ -130,7 +109,7 @@ class TrainingGovBlobExtractor:
             score += 25
             reasons.append(f"Found title column: {unit_title_col}")
 
-        # Bonus if blob looks like it contains PC numbering (1.1 etc)
+        # Bonus if blob looks like it contains PC numbering
         if blob_col:
             try:
                 sample = df[blob_col].astype(str).head(5)
@@ -140,7 +119,7 @@ class TrainingGovBlobExtractor:
             except Exception:
                 pass
 
-        # Critical guardrail: if any required column missing, DO NOT match
+        # Guardrail: only match if ALL required columns exist
         if not (unit_code_col and unit_title_col and blob_col):
             return 0, reasons
 
@@ -154,69 +133,87 @@ class TrainingGovBlobExtractor:
         if not (unit_code_col and unit_title_col and blob_col):
             raise ValueError(
                 "Missing required columns for TrainingGovBlobExtractor. "
-                f"Required: (unit code, unit title, elements/criteria blob). "
+                "Required: (unit code, unit title, elements/criteria blob). "
                 f"Found columns: {list(df.columns)}"
             )
 
-        def extract_elements(unit_code: str, unit_title: str, blob: str):
-            text = (blob or "").replace("\r\n", "\n").replace("\r", "\n")
-            text = text.strip()
+        def parse_element_blocks(blob_text: str):
+            """
+            Returns list of dicts: {"element_title": ..., "pcs_text": ...}
+            """
+            text = normalize_blob_text(blob_text)
             if not text:
                 return []
 
-            # Split on likely element headings.
-            # Supports: "Element 1: ...", "Element 2. ...", "1. ...", etc.
-            chunks = re.split(r"\n(?=(?:Element\s+\d+[:.]|\d+\.\s))", text, flags=re.I)
+            lines = text.split("\n")
 
-            rows = []
-            for chunk in chunks:
-                chunk = chunk.strip()
-                if not chunk:
+            blocks = []
+            current_element = None
+            current_pcs = []
+
+            # Patterns
+            element_num_pat = re.compile(r"^(?P<num>\d+)\.\s+(?P<title>.+)$")
+            element_word_pat = re.compile(r"^Element\s+\d+\s*:\s*(?P<title>.+)$", re.I)
+            pc_pat = re.compile(r"^(?P<num>\d+\.\d+)\.\s+(?P<txt>.+)$")
+
+            for ln in lines:
+                # Ignore header noise
+                if ln.lower().startswith("elements performance criteria"):
+                    continue
+                if "elements describe the essential outcomes" in ln.lower():
+                    continue
+                if "performance criteria describe the performance needed" in ln.lower():
                     continue
 
-                # Identify element title line
-                # Element 1: Title
-                m1 = re.match(r"^(?:Element\s+\d+[:.])\s*(.+)$", chunk, flags=re.I)
-                # 1. Title
-                m2 = re.match(r"^(?:\d+\.)\s*(.+)$", chunk, flags=re.I)
-
-                element_title = None
-                if m1:
-                    element_title = _clean(m1.group(1))
-                elif m2:
-                    element_title = _clean(m2.group(1))
-
-                # Extract performance criteria lines like:
-                # 1.1 Do X
-                # 1.2 Do Y
-                pcs = re.findall(r"(?m)^\s*(\d+\.\d+)\.?\s+(.*)$", chunk)
-                pcs_text = "\n".join([f"{num}. {txt.strip()}" for num, txt in pcs]).strip() if pcs else ""
-
-                # If we didn't reliably detect an element title, skip this chunk (avoid junk rows)
-                if not element_title:
+                m_pc = pc_pat.match(ln)
+                if m_pc:
+                    current_pcs.append(f"{m_pc.group('num')}. {m_pc.group('txt').strip()}")
                     continue
 
-                rows.append({
-                    "unit_code": unit_code,
-                    "unit_title": unit_title,
-                    "element_title": element_title,
-                    "pcs_text": pcs_text
+                m_elw = element_word_pat.match(ln)
+                m_eln = element_num_pat.match(ln)
+
+                if m_elw or m_eln:
+                    # flush previous block
+                    if current_element:
+                        blocks.append({
+                            "element_title": current_element,
+                            "pcs_text": "\n".join(current_pcs).strip()
+                        })
+                    current_pcs = []
+                    current_element = _clean((m_elw.group("title") if m_elw else m_eln.group("title")))
+                    continue
+
+            # flush last block
+            if current_element:
+                blocks.append({
+                    "element_title": current_element,
+                    "pcs_text": "\n".join(current_pcs).strip()
                 })
 
-            return rows
+            return blocks
 
         out_rows = []
         for _, r in df.iterrows():
-            out_rows.extend(
-                extract_elements(
-                    str(r[unit_code_col]),
-                    str(r[unit_title_col]),
-                    str(r[blob_col])
-                )
-            )
+            unit_code = str(r[unit_code_col])
+            unit_title = str(r[unit_title_col])
+            blob = str(r[blob_col])
 
-        out = pd.DataFrame(out_rows).dropna(subset=["unit_code", "unit_title", "element_title"])
+            blocks = parse_element_blocks(blob)
+            for b in blocks:
+                out_rows.append({
+                    "unit_code": unit_code,
+                    "unit_title": unit_title,
+                    "element_title": b["element_title"],
+                    "pcs_text": b["pcs_text"],
+                })
+
+        # IMPORTANT: always return a df with the expected columns
+        if not out_rows:
+            return pd.DataFrame(columns=OUT_COLS)
+
+        out = pd.DataFrame(out_rows, columns=OUT_COLS)
         out["element_title"] = out["element_title"].astype(str).map(_clean)
+        out = out.dropna(subset=["unit_code", "unit_title", "element_title"])
         out = out[out["element_title"].str.len() > 0].reset_index(drop=True)
-
         return out
