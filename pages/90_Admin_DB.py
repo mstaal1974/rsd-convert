@@ -63,7 +63,13 @@ with tab1:
     source_file = colC.text_input("Source label (optional)", value="upload")
 
     if q_file:
-        df_preview = pd.read_csv(q_file) if q_file.name.lower().endswith(".csv") else pd.read_excel(q_file)
+        try:
+    df_preview = pd.read_csv(q_file) if q_file.name.lower().endswith(".csv") else pd.read_excel(q_file)
+except ImportError as e:
+    st.error("Reading Excel requires openpyxl. Add `openpyxl` to requirements.txt and redeploy.")
+    st.code(str(e))
+    st.stop()
+
         st.dataframe(df_preview.head(25), use_container_width=True)
 
         if st.button("Load Qualifications + Units into DB", type="primary"):
