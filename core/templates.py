@@ -1,0 +1,18 @@
+RSD_COLUMNS = [
+    "Canonical URL",
+    "Unit of competency Name ",
+    "Author",
+    "Skill Statement",
+    "Category",
+    "Keywords",
+    "Standards",
+    "Certifications",
+    "Occupation Major Groups",
+    "Occupation Minor Groups",
+    "Broad Occupations",
+    "Detailed Occupations",
+    "O*Net Job Codes",
+    "Employers",
+    "Alignment Name",
+    "Alignment URL",
+]
