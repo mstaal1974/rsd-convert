@@ -31,7 +31,8 @@ except Exception:
     KEYWORDS_AVAILABLE = False
 
 load_dotenv()
-
+engine = get_engine()
+init_db(engine)
 st.set_page_config(page_title="Training Package → Element Skills (BART)", layout="wide")
 st.title("Training Package → Element-level Skill Statements (BART)")
 
@@ -72,6 +73,7 @@ def init_state():
 
         # UI
         "next_index_ui": 0,  # local pointer (DB is source of truth when resuming)
+        "next_index": 0,  # legacy/resume pointer name (some code paths use this)
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -226,54 +228,38 @@ if total == 0:
 # -----------------------------
 # Run selection (DB)
 # -----------------------------
+# Decide run_id before computing start_index.
 run_id = st.session_state.get("run_id")
 
 if db_ready and use_resume and resume_run_id.strip():
-    run_id = resume_run_id.strip()
-    st.session_state["run_id"] = run_id
+    st.session_state["run_id"] = resume_run_id.strip()
 
-# Create a new run if none selected and DB is ready
-if db_ready and not run_id:
-    settings = {
-        "batch_size": int(batch_size),
-        "max_fixes": int(max_fixes),
-        "temperature": float(temperature),
-        "generate_keywords": bool(generate_kw),
-        "extractor_mode": extractor_mode,
-        "forced_extractor": forced,
-    }
-    try:
-        run_id = create_run(
+if db_ready and use_resume and st.session_state.get("run_id"):
+    # If resuming, load the run pointer from DB
+    st.session_state["run_id"] = st.session_state["run_id"].strip()
+    start_index = get_next_index(engine, st.session_state["run_id"])
+else:
+    # New run: create once per upload
+    if st.session_state.get("run_id") is None:
+        settings = {
+            "batch_size": int(batch_size),
+            "max_fixes": int(max_fixes),
+            "generate_keywords": bool(generate_kw),
+        }
+        st.session_state["run_id"] = create_run(
             engine,
             source_filename=getattr(uploaded, "name", "uploaded.csv"),
             source_fingerprint=fp,
-            extractor_name=str(extractor_used),
+            extractor_name=extractor_used,
             extractor_version="1.0.0",
             sil_version="1.0.0",
             model=model,
             settings=settings,
-            training_package=None,
         )
-        st.session_state["run_id"] = run_id
-    except Exception as e:
-        st.error(f"Failed to create DB run: {e}")
-        st.stop()
+    start_index = int(st.session_state.get("next_index", st.session_state.get("next_index_ui", 0)))
 
-# Display run id (or note DB disabled)
-if db_ready and run_id:
-    st.info(f"Run ID (save this to resume later): **{run_id}**")
-elif not db_ready:
-    st.warning("DB not available. This app will still run, but results won’t persist beyond the session.")
-
-# Determine next index from DB if resuming, else from UI pointer
-if db_ready and run_id:
-    try:
-        start_index = get_next_index(engine, run_id)
-    except Exception as e:
-        st.error(f"Failed to read resume position from DB: {e}")
-        st.stop()
-else:
-    start_index = int(st.session_state["next_index_ui"])
+if st.session_state.get("run_id"):
+    st.info(f"Run ID: {st.session_state['run_id']}")
 
 end_index = min(total, start_index + int(batch_size))
 st.info(f"Ready to process batch: rows **{start_index} → {end_index - 1}** (of {total}).")
@@ -396,16 +382,29 @@ batch_df["bart_temperature"] = float(temperature)
 if generate_kw and KEYWORDS_AVAILABLE:
     batch_df["keywords"] = keyword_list
 
-status.write("Batch complete ✅")
-
-# Persist batch to DB
-if db_ready and run_id:
+# Persist batch immediately using the session run_id when DB is available
+if db_ready and st.session_state.get("run_id"):
     try:
-        upsert_skill_records(engine, run_id=run_id, batch_df=batch_df, row_index_start=start_index)
-        update_run_status(engine, run_id, "running")
-        st.success("Stored batch in DB ✅")
+        upsert_skill_records(
+            engine,
+            run_id=st.session_state["run_id"],
+            batch_df=batch_df,
+            row_index_start=start_index,
+        )
     except Exception as e:
         st.error(f"Failed to store batch in DB: {e}")
+        st.stop()
+
+status.write("Batch complete ✅")
+
+# Update run status and give user feedback (DB-aware)
+if db_ready and st.session_state.get("run_id"):
+    try:
+        # mark running for this batch (final completion will set 'completed' when done)
+        update_run_status(engine, st.session_state["run_id"], "running")
+        st.success("Stored batch in DB ✅")
+    except Exception as e:
+        st.error(f"Failed to update run status in DB: {e}")
         st.stop()
 else:
     # Local pointer update (non-persistent mode)
@@ -421,8 +420,11 @@ st.dataframe(batch_df[cols].head(50), use_container_width=True)
 
 # Finalize run if done
 done = end_index >= total
-if db_ready and run_id:
-    update_run_status(engine, run_id, "completed" if done else "running")
+if db_ready and st.session_state.get("run_id"):
+    if done:
+        update_run_status(engine, st.session_state["run_id"], "completed")
+    else:
+        update_run_status(engine, st.session_state["run_id"], "running")
 
 st.subheader("Downloads (from DB)")
 if db_ready and run_id:
