@@ -10,7 +10,7 @@ def to_rsd_rows(norm_df: pd.DataFrame, author="training.gov.au") -> pd.DataFrame
             "Author": author,
             "Skill Statement": r.get("skill_statement", ""),
             "Category": "",
-            "Keywords": "",
+            "Keywords": r.get("keywords", ""),
             "Standards": "",
             "Certifications": f"{r['unit_code']} {r['unit_title']}",
             "Occupation Major Groups": "",
