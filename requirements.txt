@@ -1,7 +1,8 @@
 psycopg2-binary
 python-dotenv
 pandas
-streamlit
+streamlit==1.41.1
 openai
 sqlalchemy==2.0.36
 psycopg2-binary==2.9.9
+rich>=10.14.0,<14
