@@ -63,12 +63,23 @@ with tab1:
     source_file = colC.text_input("Source label (optional)", value="upload")
 
     if q_file:
-        try:
-    df_preview = pd.read_csv(q_file) if q_file.name.lower().endswith(".csv") else pd.read_excel(q_file)
-except ImportError as e:
-    st.error("Reading Excel requires openpyxl. Add `openpyxl` to requirements.txt and redeploy.")
-    st.code(str(e))
-    st.stop()
+    try:
+        if q_file.name.lower().endswith(".csv"):
+            df_preview = pd.read_csv(q_file)
+        else:
+            df_preview = pd.read_excel(q_file)
+    except ImportError as e:
+        st.error("Reading Excel requires openpyxl. Add `openpyxl` to requirements.txt and redeploy.")
+        st.code(str(e))
+        st.stop()
+    except Exception as e:
+        st.error("Failed to read file.")
+        st.code(str(e))
+        st.stop()
+
+    st.write("Columns detected:", list(df_preview.columns))
+    st.dataframe(df_preview.head(25), use_container_width=True)
+
 
         st.dataframe(df_preview.head(25), use_container_width=True)
 
