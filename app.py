@@ -10,14 +10,12 @@ from core.extractor import normalize_training_package_csv, build_registry
 from core.bart_generator import generate_skill_statement
 from core.exporters import to_rsd_rows, to_traceability
 
-# Optional module (you'll create this file per earlier message)
-# If you haven't added it yet, keep the toggle OFF (default) or add the file.
+# Optional keywords module
 try:
     from core.keyword_generator import generate_keywords
     KEYWORDS_AVAILABLE = True
 except Exception:
     KEYWORDS_AVAILABLE = False
-
 
 load_dotenv()
 
@@ -29,19 +27,53 @@ default_model = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
 
 reg = build_registry()
 
+
+# -----------------------------
+# Helpers
+# -----------------------------
 def has_pc_token(s: str) -> bool:
     return bool(re.search(r"\b\d+\.\d+\b", str(s or "")))
 
+
+def init_state():
+    for k, v in {
+        "norm_df": None,
+        "extractor_used": None,
+        "scorecard": None,
+        "results_df": None,  # accumulated processed rows
+        "next_index": 0,     # resume pointer
+        "last_file_fingerprint": None,
+    }.items():
+        if k not in st.session_state:
+            st.session_state[k] = v
+
+
+def fingerprint_df(df: pd.DataFrame) -> str:
+    # stable-ish fingerprint to detect new uploads
+    return f"{len(df)}|{','.join(map(str, df.columns))}"
+
+
+init_state()
+
+# -----------------------------
+# Sidebar controls
+# -----------------------------
 with st.sidebar:
     st.header("Runtime")
     st.caption(f"OpenAI SDK version: {getattr(openai, '__version__', 'unknown')}")
-    st.caption("Tip: keep Max elements low when testing.")
 
     st.divider()
-    st.header("Settings")
+    st.header("Model + Cost Control")
     model = st.text_input("Model", value=default_model)
-    max_rows = st.number_input("Max elements to process (cost control)", min_value=1, value=200)
-    max_fixes = st.slider("Max auto-fixes per element (QA rewrite loop)", min_value=0, max_value=3, value=2)
+    max_fixes = st.slider("Max auto-fixes per element", min_value=0, max_value=3, value=1)
+
+    st.caption("For large runs: set fixes to 0–1 and use batching.")
+
+    st.divider()
+    st.header("Batching / Resume")
+    batch_size = st.number_input("Batch size (elements per run)", min_value=10, max_value=500, value=100, step=10)
+    manual_start = st.number_input("Start index override (optional)", min_value=0, value=0, step=1)
+    use_manual_start = st.toggle("Use start index override", value=False)
 
     st.divider()
     st.header("Keywords")
@@ -62,7 +94,15 @@ with st.sidebar:
         forced = st.selectbox("Extractor", reg.list_names())
 
     st.divider()
-    run_button = st.button("Run BART transformation", type="primary")
+    colA, colB = st.columns(2)
+    run_batch = colA.button("Run next batch", type="primary")
+    reset_run = colB.button("Reset run")
+
+# Reset run state (user-triggered)
+if reset_run:
+    st.session_state["results_df"] = None
+    st.session_state["next_index"] = 0
+    st.success("Run state reset. Upload a file and start again.")
 
 uploaded = st.file_uploader("Upload training package CSV", type=["csv"])
 
@@ -70,18 +110,37 @@ if not uploaded:
     st.info("Upload a training package CSV to begin.")
     st.stop()
 
-# Read CSV
 raw_df = pd.read_csv(uploaded)
+
+# Detect new upload and reset state if needed
+fp = fingerprint_df(raw_df)
+if st.session_state["last_file_fingerprint"] != fp:
+    st.session_state["last_file_fingerprint"] = fp
+    st.session_state["results_df"] = None
+    st.session_state["next_index"] = 0
+    st.session_state["norm_df"] = None
+    st.session_state["scorecard"] = None
+    st.session_state["extractor_used"] = None
+
 st.subheader("Preview (raw)")
 st.dataframe(raw_df.head(20), use_container_width=True)
 
-# Extract / normalize
-try:
-    norm_df, extractor_used, scorecard = normalize_training_package_csv(raw_df, forced_extractor=forced)
-    st.success(f"Extractor used: {extractor_used}")
-except Exception as e:
-    st.error(f"Extraction failed: {e}")
-    st.stop()
+# Normalize / extract (only once per upload)
+if st.session_state["norm_df"] is None:
+    try:
+        norm_df, extractor_used, scorecard = normalize_training_package_csv(raw_df, forced_extractor=forced)
+        st.session_state["norm_df"] = norm_df
+        st.session_state["extractor_used"] = extractor_used
+        st.session_state["scorecard"] = scorecard
+    except Exception as e:
+        st.error(f"Extraction failed: {e}")
+        st.stop()
+
+norm_df = st.session_state["norm_df"]
+extractor_used = st.session_state["extractor_used"]
+scorecard = st.session_state["scorecard"]
+
+st.success(f"Extractor used: {extractor_used}")
 
 if scorecard is not None:
     st.subheader("Extractor scorecard")
@@ -91,7 +150,7 @@ st.subheader("Normalized (Unit → Element → PCs)")
 st.write(f"Detected **{len(norm_df)}** element records.")
 st.dataframe(norm_df.head(30), use_container_width=True)
 
-# Diagnostics: element titles polluted by PC tokens (should be 0)
+# Diagnostics: element titles should NOT contain PC tokens
 if "element_title" in norm_df.columns:
     bad = norm_df[norm_df["element_title"].apply(has_pc_token)]
     if len(bad) > 0:
@@ -100,7 +159,42 @@ if "element_title" in norm_df.columns:
     else:
         st.caption("Diagnostics: element titles are clean (no PC tokens detected).")
 
-if not run_button:
+total = len(norm_df)
+if total == 0:
+    st.error("No elements found after normalization.")
+    st.stop()
+
+# Determine start index (resume)
+start_index = int(manual_start) if use_manual_start else int(st.session_state["next_index"])
+start_index = max(0, min(start_index, total))  # clamp
+end_index = min(total, start_index + int(batch_size))
+
+st.info(f"Ready to process batch: rows **{start_index} → {end_index - 1}** (of {total}).")
+
+# Show accumulated progress
+processed_so_far = 0 if st.session_state["results_df"] is None else len(st.session_state["results_df"])
+st.write(f"Processed so far: **{processed_so_far} / {total}**")
+
+# Allow download of partial results anytime
+if st.session_state["results_df"] is not None and len(st.session_state["results_df"]) > 0:
+    st.subheader("Partial downloads (so far)")
+    partial_rsd = to_rsd_rows(st.session_state["results_df"])
+    partial_trace = to_traceability(st.session_state["results_df"])
+    st.download_button(
+        "Download PARTIAL RSD output CSV",
+        data=partial_rsd.to_csv(index=False).encode("utf-8"),
+        file_name="rsd_output_partial.csv",
+        mime="text/csv",
+    )
+    st.download_button(
+        "Download PARTIAL traceability CSV",
+        data=partial_trace.to_csv(index=False).encode("utf-8"),
+        file_name="traceability_partial.csv",
+        mime="text/csv",
+    )
+
+# Only run generation when user clicks
+if not run_batch:
     st.stop()
 
 # OpenAI client
@@ -110,13 +204,16 @@ if not api_key:
 
 client = OpenAI(api_key=api_key)
 
-work_df = norm_df.head(int(max_rows)).copy()
-total = len(work_df)
-if total == 0:
-    st.error("No elements to process after normalization.")
+batch_df = norm_df.iloc[start_index:end_index].copy()
+if len(batch_df) == 0:
+    st.warning("No rows in this batch (you may already be finished).")
     st.stop()
 
-# Generate
+st.subheader("Running batch")
+progress = st.progress(0)
+status = st.empty()
+
+# Generate for batch
 skill_statements = []
 prompts = []
 qa_one_sentence = []
@@ -126,11 +223,8 @@ qa_has_outcome = []
 qa_passes = []
 keyword_list = []
 
-progress = st.progress(0)
-status = st.empty()
-
-for i, (_, row) in enumerate(work_df.iterrows(), start=1):
-    status.write(f"Generating {i}/{total} …")
+for i, (_, row) in enumerate(batch_df.iterrows(), start=1):
+    status.write(f"Generating {i}/{len(batch_df)} …")
 
     skill, qa, bart_prompt = generate_skill_statement(
         client=client,
@@ -159,41 +253,57 @@ for i, (_, row) in enumerate(work_df.iterrows(), start=1):
         )
         keyword_list.append(kws)
 
-    progress.progress(i / total)
+    progress.progress(i / len(batch_df))
 
-work_df["skill_statement"] = skill_statements
-work_df["bart_prompt"] = prompts
-work_df["qa_one_sentence"] = qa_one_sentence
-work_df["qa_word_count"] = qa_word_count
-work_df["qa_has_method"] = qa_has_method
-work_df["qa_has_outcome"] = qa_has_outcome
-work_df["qa_passes"] = qa_passes
+batch_df["skill_statement"] = skill_statements
+batch_df["bart_prompt"] = prompts
+batch_df["qa_one_sentence"] = qa_one_sentence
+batch_df["qa_word_count"] = qa_word_count
+batch_df["qa_has_method"] = qa_has_method
+batch_df["qa_has_outcome"] = qa_has_outcome
+batch_df["qa_passes"] = qa_passes
 
 if generate_kw and KEYWORDS_AVAILABLE:
-    work_df["keywords"] = keyword_list
+    batch_df["keywords"] = keyword_list
 
-status.write("Done ✅")
+status.write("Batch complete ✅")
 
-st.subheader("Results (sample)")
+# Accumulate results
+if st.session_state["results_df"] is None:
+    st.session_state["results_df"] = batch_df
+else:
+    st.session_state["results_df"] = pd.concat([st.session_state["results_df"], batch_df], ignore_index=True)
+
+# Update resume pointer
+st.session_state["next_index"] = end_index
+
+# Show batch results
+st.subheader("Batch results (sample)")
 cols = ["unit_code", "unit_title", "element_title", "skill_statement", "qa_passes"]
 if generate_kw and KEYWORDS_AVAILABLE:
     cols.append("keywords")
-st.dataframe(work_df[cols].head(50), use_container_width=True)
+st.dataframe(batch_df[cols].head(50), use_container_width=True)
 
-# Export
-rsd_df = to_rsd_rows(work_df)          # Ensure exporters.py maps Category & Keywords as you want
-trace_df = to_traceability(work_df)
-
+# Final downloads if complete
+done = st.session_state["next_index"] >= total
 st.subheader("Downloads")
+rsd_df = to_rsd_rows(st.session_state["results_df"])
+trace_df = to_traceability(st.session_state["results_df"])
+
 st.download_button(
-    "Download RSD output CSV",
+    "Download RSD output CSV (current)",
     data=rsd_df.to_csv(index=False).encode("utf-8"),
-    file_name="rsd_output.csv",
+    file_name="rsd_output.csv" if done else "rsd_output_in_progress.csv",
     mime="text/csv",
 )
 st.download_button(
-    "Download traceability CSV",
+    "Download traceability CSV (current)",
     data=trace_df.to_csv(index=False).encode("utf-8"),
-    file_name="traceability.csv",
+    file_name="traceability.csv" if done else "traceability_in_progress.csv",
     mime="text/csv",
 )
+
+if done:
+    st.success("All elements processed ✅")
+else:
+    st.info(f"Next batch will start at index **{st.session_state['next_index']}**")
