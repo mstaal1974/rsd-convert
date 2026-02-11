@@ -4,7 +4,7 @@ import pandas as pd
 # -----------------------------
 # Output schema (normalized)
 # -----------------------------
-OUT_COLS = ["unit_code", "unit_title", "element_title", "pcs_text"]
+OUT_COLS = ["unit_code", "unit_title", "element_title", "pcs_text", "asced6_name"]
 
 
 # -----------------------------
@@ -30,7 +30,11 @@ def norm_col(c: str) -> str:
 def find_unit_code_col(df: pd.DataFrame):
     for c in df.columns:
         n = norm_col(c)
-        if n in {"unit code", "unitcode", "code", "national code", "nationalcode", "uoc code", "competency code"}:
+        if n in {
+            "unit code", "unitcode", "code",
+            "national code", "nationalcode",
+            "uoc code", "competency code"
+        }:
             return c
         if ("unit" in n and "code" in n) or ("national" in n and "code" in n) or ("uoc" in n and "code" in n) or (
             "competency" in n and "code" in n
@@ -43,16 +47,10 @@ def find_unit_title_col(df: pd.DataFrame):
     for c in df.columns:
         n = norm_col(c)
         if n in {
-            "unit title",
-            "unit name",
-            "title",
-            "name",
-            "national title",
-            "national name",
-            "uoc title",
-            "uoc name",
-            "competency title",
-            "competency name",
+            "unit title", "unit name", "title", "name",
+            "national title", "national name",
+            "uoc title", "uoc name",
+            "competency title", "competency name",
         }:
             return c
         if ("unit" in n and ("title" in n or "name" in n)) or ("national" in n and ("title" in n or "name" in n)) or (
@@ -81,6 +79,22 @@ def find_blob_col(df: pd.DataFrame):
     return None
 
 
+def find_asced6_name_col(df: pd.DataFrame):
+    """
+    Find ASCED6 Name column (used to populate Category in RSD output).
+    Common headers:
+    - ASCED6 Name
+    - ASCED 6 Name
+    """
+    for c in df.columns:
+        n = norm_col(c)
+        if n in {"asced6 name", "asced 6 name", "asced name"}:
+            return c
+        if "asced6" in n and "name" in n:
+            return c
+    return None
+
+
 def strip_pcs_from_element_title(title: str) -> str:
     """
     Safety net: truncate element title at first PC token (e.g., 1.1, 2.3)
@@ -103,7 +117,6 @@ def normalize_blob_text(text: str) -> str:
     - 1.1 Do something
     """
     t = (text or "").replace("\r\n", "\n").replace("\r", "\n")
-    # flatten whitespace (many exports are one long line)
     t = re.sub(r"\s+", " ", t).strip()
 
     if not t:
@@ -173,6 +186,7 @@ class TrainingGovBlobExtractor:
         unit_code_col = find_unit_code_col(df)
         unit_title_col = find_unit_title_col(df)
         blob_col = find_blob_col(df)
+        asced6_name_col = find_asced6_name_col(df)
 
         if not (unit_code_col and unit_title_col and blob_col):
             raise ValueError(
@@ -252,6 +266,10 @@ class TrainingGovBlobExtractor:
             unit_title = str(r[unit_title_col])
             blob = str(r[blob_col])
 
+            asced6_name = ""
+            if asced6_name_col:
+                asced6_name = str(r[asced6_name_col]).strip()
+
             blocks = parse_element_blocks(blob)
             for b in blocks:
                 out_rows.append(
@@ -260,6 +278,7 @@ class TrainingGovBlobExtractor:
                         "unit_title": unit_title,
                         "element_title": b["element_title"],
                         "pcs_text": b["pcs_text"],
+                        "asced6_name": asced6_name,
                     }
                 )
 
