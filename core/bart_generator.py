@@ -37,17 +37,26 @@ Constraints:
 Return ONLY the revised sentence.
 """.strip()
 
+def _chat_generate(client: OpenAI, model: str, prompt: str) -> str:
+    resp = client.chat.completions.create(
+        model=model,
+        messages=[
+            {"role": "system", "content": "You are an expert skills taxonomy writer who follows constraints exactly."},
+            {"role": "user", "content": prompt},
+        ],
+        temperature=0.2,
+    )
+    return resp.choices[0].message.content.strip()
+
 def generate_skill_statement(client: OpenAI, model: str, unit_code, unit_title, element_title, pcs_text, max_fixes: int = 2):
     prompt = build_bart_prompt(unit_code, unit_title, element_title, pcs_text)
-    resp = client.responses.create(model=model, input=prompt)
-    skill = resp.output_text.strip()
+    skill = _chat_generate(client, model, prompt)
 
     qa = qa_check(skill)
     fixes = 0
     while not qa["passes"] and fixes < max_fixes:
         fix_prompt = build_fix_prompt(unit_code, unit_title, element_title, pcs_text, skill)
-        fix = client.responses.create(model=model, input=fix_prompt)
-        skill = fix.output_text.strip()
+        skill = _chat_generate(client, model, fix_prompt)
         qa = qa_check(skill)
         fixes += 1
 
