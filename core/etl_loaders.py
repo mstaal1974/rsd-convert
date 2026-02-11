@@ -391,3 +391,277 @@ def load_occupation_crosswalk(
         conn.execute(UPSERT_CROSSWALK, rows)
 
     return {"status": "ok", "crosswalk_rows_upserted": len(rows), "filename": filename}
+def _read_excel_sheetnames(file) -> list:
+    try:
+        xls = pd.ExcelFile(file)
+        return list(xls.sheet_names)
+    except Exception:
+        return []
+
+
+def is_osca_structure_xlsx(file, filename: str) -> bool:
+    """
+    OSCA structure XLSX typically contains sheets named Table 1..5 and Table 5 is 'complete structure'.
+    """
+    name = (filename or "").lower()
+    if not (name.endswith(".xlsx") or name.endswith(".xls")):
+        return False
+    sheets = _read_excel_sheetnames(file)
+    s_norm = {str(s).strip().lower() for s in sheets}
+    return ("table 5" in s_norm) or ("table 4" in s_norm and "contents" in s_norm)
+
+
+def is_osca_index_titles(df: pd.DataFrame) -> bool:
+    """
+    Heuristic detection for the OSCA index of principal titles and alternative titles CSV.
+    We look for columns that resemble principal/alternative titles.
+    """
+    cols = {_norm(c) for c in df.columns}
+    has_principal = any("principal" in c and "title" in c for c in cols) or any(c in {"principal title"} for c in cols)
+    has_alts = any("alternative" in c and "title" in c for c in cols) or any(c in {"alternative titles"} for c in cols)
+    has_code = any("osca" in c and "code" in c for c in cols) or any(c in {"identifier", "code"} for c in cols)
+    return bool(has_principal and (has_alts or has_code))
+
+
+def load_osca_structure(
+    engine: Engine,
+    file,
+    filename: str,
+    *,
+    taxonomy_version: Optional[str] = None,
+    taxonomy_source: str = "official",
+    sheet_name: Optional[str] = "Table 5",
+) -> Dict[str, Any]:
+    """
+    Purpose-built loader for your OSCA structure XLSX.
+
+    Your OSCA structure file (Table 5) is a "staircase" layout:
+
+      col0: Major group code      (e.g., 1)
+      col1: Major group name      (e.g., Managers)
+
+      col1: Sub-major code        (e.g., 11)
+      col2: Sub-major name
+
+      col2: Minor group code      (e.g., 111)
+      col3: Minor group name
+
+      col3: Unit group code       (e.g., 1111)
+      col4: Unit group name
+
+      col4: Occupation code       (e.g., 111131)
+      col5: Occupation title
+      col6: Skill level (optional)
+
+    We create records for:
+      - major / sub_major / minor / unit_group / occupation
+    in the `occupations` table, with parent_code relationships.
+    """
+    # IMPORTANT: ExcelFile reads the stream; reset pointer if needed
+    try:
+        file.seek(0)
+    except Exception:
+        pass
+
+    sheets = _read_excel_sheetnames(file)
+    if not sheets:
+        raise ValueError("Could not read sheet names from XLSX")
+
+    # Choose best sheet
+    chosen = None
+    if sheet_name and any(str(s).strip().lower() == str(sheet_name).strip().lower() for s in sheets):
+        chosen = next(s for s in sheets if str(s).strip().lower() == str(sheet_name).strip().lower())
+    else:
+        # fallback to any table that looks like the complete structure
+        for s in sheets:
+            if str(s).strip().lower() == "table 5":
+                chosen = s
+                break
+        if not chosen:
+            chosen = sheets[0]
+
+    # Read with header=None so we can find the actual start row
+    try:
+        file.seek(0)
+    except Exception:
+        pass
+
+    raw = pd.read_excel(file, sheet_name=chosen, header=None)
+
+    # Find the row where the real table begins.
+    # In your file, row with "Identifier" appears in col0 a few rows above data.
+    start_row = None
+    for i in range(min(len(raw), 50)):
+        row_vals = [str(x).strip().lower() for x in raw.iloc[i].tolist() if pd.notna(x)]
+        if any(v == "identifier" for v in row_vals):
+            start_row = i + 1
+            break
+    if start_row is None:
+        # fallback: find the row containing "Occupation" (often near headers)
+        for i in range(min(len(raw), 80)):
+            row_vals = [str(x).strip().lower() for x in raw.iloc[i].tolist() if pd.notna(x)]
+            if any(v == "occupation" for v in row_vals):
+                start_row = i + 1
+                break
+
+    if start_row is None:
+        raise ValueError("Could not locate the start of the OSCA structure table (Identifier row not found).")
+
+    df = raw.iloc[start_row:].copy()
+    # Keep only first 7 columns used by the structure
+    df = df.iloc[:, :7]
+    df.columns = ["major_code", "major_name",
+                  "sub_code_or_name", "minor_code_or_name",
+                  "unit_code_or_name", "occupation_name", "skill_level"]
+
+    # The staircase columns mean codes and names are interleaved and shifted.
+    # We'll reconstruct by reading the original raw columns by position.
+    # Actual positions we observed:
+    #   major_code in col0, major_name in col1
+    #   sub_code in col1, sub_name in col2
+    #   minor_code in col2, minor_name in col3
+    #   unit_code in col3, unit_name in col4
+    #   occ_code in col4, occ_name in col5
+    #   skill_level in col6
+
+    # Re-read the same region with numeric columns for safe indexing
+    df2 = raw.iloc[start_row:, :7].copy()
+    df2.columns = list(range(7))
+
+    # Build canonical columns (codes + names)
+    out = pd.DataFrame({
+        "major_code": df2[0],
+        "major_name": df2[1],
+        "sub_code": df2[1],
+        "sub_name": df2[2],
+        "minor_code": df2[2],
+        "minor_name": df2[3],
+        "unit_code": df2[3],
+        "unit_name": df2[4],
+        "occ_code": df2[4],
+        "occ_name": df2[5],
+        "skill_level": df2[6],
+    })
+
+    # Forward fill group codes/names down the sheet
+    for c in ["major_code", "major_name", "sub_code", "sub_name", "minor_code", "minor_name", "unit_code", "unit_name"]:
+        out[c] = out[c].ffill()
+
+    # Clean
+    for c in out.columns:
+        out[c] = out[c].apply(_to_str)
+
+    # Helper to create occupation records
+    records = {}
+    def add_rec(level_type: str, code: str, name: str, parent_code: Optional[str]):
+        if not code or not name:
+            return
+        occ_id = build_occupation_id("OSCA", code)
+        if occ_id in records:
+            return
+        records[occ_id] = {
+            "occupation_id": occ_id,
+            "occupation_name": name,
+            "taxonomy_source": taxonomy_source,
+            "taxonomy_version": taxonomy_version,
+            "major_group": None,
+            "minor_group": None,
+            "broad_group": None,
+            "detailed_group": None,
+            "description": None,
+            "taxonomy_system": "OSCA",
+            "taxonomy_code": code,
+            "level_type": level_type,
+            "parent_code": parent_code or None,
+        }
+
+    # Insert hierarchy levels + occupations
+    for _, r in out.iterrows():
+        major_code, major_name = r["major_code"], r["major_name"]
+        sub_code, sub_name = r["sub_code"], r["sub_name"]
+        minor_code, minor_name = r["minor_code"], r["minor_name"]
+        unit_code, unit_name = r["unit_code"], r["unit_name"]
+        occ_code, occ_name = r["occ_code"], r["occ_name"]
+
+        # Heuristic: major codes are typically 1 digit; sub 2; minor 3; unit 4; occ 6
+        # But we don’t rely on length — we rely on the staircase layout.
+        add_rec("major", major_code, major_name, None)
+        add_rec("sub_major", sub_code, sub_name, major_code)
+        add_rec("minor", minor_code, minor_name, sub_code)
+        add_rec("unit_group", unit_code, unit_name, minor_code)
+
+        # Only add occupation when it looks like an occupation row (occ_code present AND occ_name present)
+        if occ_code and occ_name:
+            add_rec("occupation", occ_code, occ_name, unit_code)
+
+    with engine.begin() as conn:
+        conn.execute(UPSERT_OCC, list(records.values()))
+
+    return {
+        "status": "ok",
+        "filename": filename,
+        "sheet_used": chosen,
+        "rows_read": len(out),
+        "occupations_upserted": len(records),
+        "note": "Loaded OSCA hierarchy (major/sub-major/minor/unit group/occupation) into occupations table."
+    }
+
+
+def load_osca_index_titles(
+    engine: Engine,
+    file,
+    filename: str,
+    *,
+    taxonomy_version: Optional[str] = None,
+    taxonomy_source: str = "official",
+) -> Dict[str, Any]:
+    """
+    Loads OSCA 'Index of principal titles and alternative titles' (flat list).
+    This is best used for synonyms/search enrichment.
+
+    Minimum expected columns:
+      - OSCA code / Identifier / Code
+      - Principal Title
+    Optional:
+      - Alternative Titles (comma/semicolon separated)
+    """
+    df = _read_any(file, filename)
+
+    code_col = _require(df, "osca_code", ["osca code", "identifier", "code", "taxonomy code", "occupation code"])
+    principal_col = _require(df, "principal_title", ["principal title", "occupation name", "title", "name"])
+    alt_col = _find_col(df, ["alternative titles", "alt titles", "alternate titles", "synonyms"])
+
+    rows = []
+    for _, r in df.iterrows():
+        code = _to_str(r[code_col])
+        name = _to_str(r[principal_col])
+        if not code or not name:
+            continue
+
+        occ_id = build_occupation_id("OSCA", code)
+        desc = None
+        if alt_col:
+            alts = _to_str(r[alt_col])
+            if alts:
+                desc = f"Alternative titles: {alts}"
+
+        rows.append({
+            "occupation_id": occ_id,
+            "occupation_name": name,
+            "taxonomy_source": taxonomy_source,
+            "taxonomy_version": taxonomy_version,
+            "major_group": None,
+            "minor_group": None,
+            "broad_group": None,
+            "detailed_group": None,
+            "description": desc,
+            "taxonomy_system": "OSCA",
+            "taxonomy_code": code,
+            "level_type": "occupation",
+            "parent_code": None,
+        })
+
+    with engine.begin() as conn:
+        conn.execute(UPSERT_OCC, rows)
+
+    return {"status": "ok", "filename": filename, "occupations_upserted": len(rows)}

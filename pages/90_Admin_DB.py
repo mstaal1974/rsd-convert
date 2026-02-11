@@ -10,7 +10,12 @@ from core.etl_loaders import (
     load_occupation_taxonomy,
     load_occupation_qualification_map,
     load_occupation_crosswalk,
+    is_osca_structure_xlsx,
+    is_osca_index_titles,
+    load_osca_structure,
+    load_osca_index_titles,
 )
+
 from core.occupation_profiles import build_occupation_skill_profile, build_all_occupation_profiles
 
 st.set_page_config(page_title="Admin • DB + Taxonomy + Profiles", layout="wide")
@@ -80,26 +85,85 @@ with tab1:
 with tab2:
     st.subheader("Load ANZSCO / OSCA taxonomy and mappings")
 
-    st.markdown("### Load taxonomy")
-    t_sys = st.selectbox("Taxonomy system", ["ANZSCO", "OSCA"], index=0)
-    t_ver = st.text_input("Taxonomy version (optional)", value="")
-    t_file = st.file_uploader("Upload taxonomy file (CSV or XLSX)", type=["csv", "xlsx"], key="tax_file")
+st.markdown("### Load taxonomy (auto-detect OSCA structure vs OSCA index)")
+t_ver = st.text_input("Taxonomy version (optional)", value="")
 
-    if t_file:
-        tdf = pd.read_csv(t_file) if t_file.name.lower().endswith(".csv") else pd.read_excel(t_file)
+t_file = st.file_uploader("Upload taxonomy file (CSV or XLSX)", type=["csv", "xlsx"], key="tax_file")
+
+if t_file:
+    name = t_file.name.lower()
+
+    # Peek safely (don’t consume file permanently)
+    if name.endswith(".xlsx") or name.endswith(".xls"):
+        st.info("Detected Excel. Checking if this is OSCA Structure…")
+        t_file.seek(0)
+        is_structure = is_osca_structure_xlsx(t_file, t_file.name)
+
+        if is_structure:
+            st.success("Auto-detected: OSCA Structure (hierarchy) XLSX")
+            if st.button("Load OSCA Structure into DB", type="primary"):
+                t_file.seek(0)
+                res = load_osca_structure(
+                    engine,
+                    t_file,
+                    t_file.name,
+                    taxonomy_version=t_ver or None,
+                    taxonomy_source="official",
+                    sheet_name="Table 5",
+                )
+                st.success(res)
+        else:
+            st.warning("Excel file does not look like OSCA Structure. Loading as generic taxonomy.")
+            t_sys = st.selectbox("Taxonomy system", ["ANZSCO", "OSCA"], index=1)
+            t_file.seek(0)
+            tdf = pd.read_excel(t_file)
+            st.dataframe(tdf.head(25), use_container_width=True)
+
+            if st.button("Load taxonomy into DB"):
+                t_file.seek(0)
+                res = load_occupation_taxonomy(
+                    engine,
+                    t_file,
+                    t_file.name,
+                    taxonomy_system=t_sys,
+                    taxonomy_version=t_ver or None,
+                    taxonomy_source="official",
+                )
+                st.success(res)
+
+    else:
+        # CSV: could be OSCA index titles
+        t_file.seek(0)
+        tdf = pd.read_csv(t_file)
         st.dataframe(tdf.head(25), use_container_width=True)
 
-        if st.button("Load taxonomy into DB"):
-            t_file.seek(0)
-            res = load_occupation_taxonomy(
-                engine,
-                t_file,
-                t_file.name,
-                taxonomy_system=t_sys,
-                taxonomy_version=t_ver or None,
-                taxonomy_source="official",
-            )
-            st.success(res)
+        if is_osca_index_titles(tdf):
+            st.success("Auto-detected: OSCA Index of Principal/Alternative Titles (flat list)")
+            if st.button("Load OSCA Index Titles into DB", type="primary"):
+                t_file.seek(0)
+                res = load_osca_index_titles(
+                    engine,
+                    t_file,
+                    t_file.name,
+                    taxonomy_version=t_ver or None,
+                    taxonomy_source="official",
+                )
+                st.success(res)
+        else:
+            st.warning("CSV does not match OSCA index heuristic. Loading as generic taxonomy.")
+            t_sys = st.selectbox("Taxonomy system", ["ANZSCO", "OSCA"], index=0)
+            if st.button("Load taxonomy into DB"):
+                t_file.seek(0)
+                res = load_occupation_taxonomy(
+                    engine,
+                    t_file,
+                    t_file.name,
+                    taxonomy_system=t_sys,
+                    taxonomy_version=t_ver or None,
+                    taxonomy_source="official",
+                )
+                st.success(res)
+
 
     st.divider()
     st.markdown("### Load occupation → qualification map")
